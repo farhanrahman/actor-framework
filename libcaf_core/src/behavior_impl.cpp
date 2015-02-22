@@ -26,7 +26,7 @@ namespace detail {
 
 namespace {
 
-class combinator : public behavior_impl {
+class combinator final : public behavior_impl {
  public:
   bhvr_invoke_result invoke(message& arg) {
     auto res = first->invoke(arg);
@@ -50,6 +50,12 @@ class combinator : public behavior_impl {
     // nop
   }
 
+ protected:
+  match_case** get_cases(size_t&) {
+    // never called
+    return nullptr;
+  }
+
  private:
   pointer first;
   pointer second;
@@ -61,8 +67,25 @@ behavior_impl::~behavior_impl() {
   // nop
 }
 
-behavior_impl::behavior_impl(duration tout) : m_timeout(tout) {
+behavior_impl::behavior_impl(duration tout)
+    : m_timeout(tout),
+      m_num_cases(0),
+      m_cases(nullptr) {
   // nop
+}
+
+bhvr_invoke_result behavior_impl::invoke(message& msg) {
+  bhvr_invoke_result res;
+  for (size_t i = 0; i < m_num_cases; ++i) {
+    auto& mc = *m_cases[i];
+    if (mc.has_wildcard() || mc.type_token() == msg.type_token()) {
+      res = mc(msg);
+      if (res) {
+        return res;
+      }
+    }
+  }
+  return none;
 }
 
 behavior_impl::pointer behavior_impl::or_else(const pointer& other) {

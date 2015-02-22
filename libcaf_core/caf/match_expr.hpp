@@ -26,6 +26,7 @@
 #include "caf/variant.hpp"
 
 #include "caf/unit.hpp"
+#include "caf/match_case.hpp"
 
 #include "caf/detail/int_list.hpp"
 #include "caf/detail/type_list.hpp"
@@ -36,49 +37,11 @@
 
 #include "caf/detail/try_match.hpp"
 #include "caf/detail/type_list.hpp"
-#include "caf/detail/lifted_fun.hpp"
 #include "caf/detail/pseudo_tuple.hpp"
 #include "caf/detail/behavior_impl.hpp"
 
 namespace caf {
 namespace detail {
-
-template <class T1, typename T2>
-T2& deduce_const(T1&, T2& rhs) {
-  return rhs;
-}
-
-template <class T1, typename T2>
-const T2& deduce_const(const T1&, T2& rhs) {
-  return rhs;
-}
-
-template <class Expr, class Projecs, class Signature, class Pattern>
-class match_expr_case : public get_lifted_fun<Expr, Projecs, Signature>::type {
- public:
-  using super = typename get_lifted_fun<Expr, Projecs, Signature>::type;
-  template <class... Ts>
-  match_expr_case(Ts&&... args) : super(std::forward<Ts>(args)...) {
-    // nop
-  }
-  using pattern = Pattern;
-  using filtered_pattern =
-    typename detail::tl_filter_not_type<
-      Pattern,
-      anything
-    >::type;
-  static constexpr bool has_wildcard =
-    !std::is_same<
-      pattern,
-      filtered_pattern
-    >::value;
-  static constexpr uint32_t type_token = make_type_token_from_list<pattern>();
-  using intermediate_tuple =
-      typename detail::tl_apply<
-      filtered_pattern,
-      detail::pseudo_tuple
-    >::type;
-};
 
 template <class Expr, class Transformers, class Pattern>
 struct get_case_ {
@@ -147,11 +110,11 @@ struct get_case_ {
     >::type;
 
   using type =
-    match_expr_case<
+    match_case_impl<
       Expr,
+      Pattern,
       padded_transformers,
-      projection_signature,
-      Pattern
+      projection_signature
     >;
 };
 
@@ -205,7 +168,7 @@ struct unroll_expr {
     if ((F::has_wildcard || F::type_token == msg.type_token())
         && try_match(msg, ms.arr.data(), ms.arr.size(), targs.data)) {
       auto is = detail::get_indices(targs);
-      auto res = detail::apply_args(f, is, deduce_const(msg, targs));
+      auto res = detail::apply_args(f, is, msg);
       if (res) {
         return std::move(unroll_expr_result_unbox(res));
       }
@@ -275,15 +238,30 @@ struct match_result_from_type_list<detail::type_list<Ts...>> {
   using type = variant<none_t, typename lift_void<Ts>::type...>;
 };
 
+template <size_t Pos, size_t Size>
+struct match_expr_init_arr {
+  template <class Array, class Tuple>
+  static void init(Array& arr, Tuple& tup) {
+    arr[Pos] = &std::get<Pos>(tup);
+    match_expr_init_arr<Pos + 1, Size>::init(arr, tup);
+  }
+};
+
+template <size_t Size>
+struct match_expr_init_arr<Size, Size> {
+  template <class Array, class Tuple>
+  static void init(Array&, Tuple&) {
+    // nop
+  }
+};
+
 /**
  * A match expression encapsulating cases `Cs..., whereas
- * each case is a `detail::match_expr_case<`...>.
+ * each case is a `match_case`.
  */
 template <class... Cs>
 class match_expr {
  public:
-  static_assert(sizeof...(Cs) < 64, "too many functions");
-
   using cases_list = detail::type_list<Cs...>;
 
   using result_type =
@@ -296,25 +274,40 @@ class match_expr {
       >::type
     >::type;
 
+  using array_type = std::array<match_case*, sizeof...(Cs)>;
+
   template <class T, class... Ts>
   match_expr(T v, Ts&&... vs) : m_cases(std::move(v), std::forward<Ts>(vs)...) {
-    // nop
+    init();
   }
 
-  match_expr(match_expr&&) = default;
+  match_expr(match_expr&& other) : m_cases(std::move(other.m_cases)) {
+    init();
+  }
 
-  match_expr(const match_expr&) = default;
+  match_expr(const match_expr& other) : m_cases(other.m_cases) {
+    init();
+  }
 
-  result_type operator()(message& msg) {
-    using mutator_token = std::integral_constant<bool,
-                                                 detail::tl_exists<
-                                                   cases_list,
-                                                   detail::is_manipulator_case
-                                                 >::value>;
-    detail::detach_if_needed(msg, mutator_token{});
+  //result_type operator()(message& msg) {
+  optional<message> operator()(message& msg) {
+    /*
     auto indices = detail::get_indices(m_cases);
     detail::unroll_expr<result_type> f;
     return detail::apply_args_prefixed(f, indices, m_cases, msg);
+    */
+    for (auto fun : m_cases_arr) {
+      CAF_REQUIRE(fun != nullptr);
+      auto res = (*fun)(msg);
+      if (res) {
+        return res;
+      }
+    }
+    return none;
+  }
+
+  array_type& cases_arr() {
+    return m_cases_arr;
   }
 
   template <class... Ds>
@@ -338,10 +331,15 @@ class match_expr {
   /** @endcond */
 
  private:
-  // structure: std::tuple<std::tuple<type_list<...>, ...>,
-  //                       std::tuple<type_list<...>, ...>,
+  void init() {
+    match_expr_init_arr<0, sizeof...(Cs)>::init(m_cases_arr, m_cases);
+  }
+
+  // structure: std::tuple<match_case<...>,
+  //                       match_case<...>,
   //                       ...>
   std::tuple<Cs...> m_cases;
+  array_type m_cases_arr;
 };
 
 template <class T>
